@@ -1,418 +1,358 @@
 #!/bin/bash
-# realm-proxy.sh — realm 转发管理交互脚本
-# 用法: sudo bash realm-proxy.sh
+# realm 零拷贝 TCP 转发管理脚本 🍊
+# v2.0 — 全数字操作，自动架构检测
 
 CONFIG="/etc/realm/config.toml"
-SERVICE="realm"
-BIN="/usr/local/bin/realm"
+SERVICE_FILE="/etc/systemd/system/realm.service"
+REALM_BIN="/usr/local/bin/realm"
 
-# ======== 默认 ========
-DEFAULT_LISTEN="[::]"
+# ========== 颜色 ==========
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+NC='\033[0m'
 
-# ======== 颜色 ========
-RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; NC='\033[0m'
 ok()  { echo -e " ${GREEN}✓${NC} $1"; }
-err() { echo -e " ${RED}✗${NC} $1"; }
-info(){ echo -e " ${CYAN}→${NC} $1"; }
 warn(){ echo -e " ${YELLOW}⚠${NC} $1"; }
+err() { echo -e " ${RED}✗${NC} $1"; }
 
-# ======== 检查依赖 ========
-check_deps() {
-    if ! command -v systemctl &>/dev/null; then
-        err "systemctl 不可用"; exit 1
+# ========== 架构检测 ==========
+detect_arch() {
+    local arch
+    arch=$(uname -m)
+    case "$arch" in
+        x86_64)  echo "x86_64-unknown-linux-gnu" ;;
+        aarch64) echo "aarch64-unknown-linux-gnu" ;;
+        armv7l|armv7) echo "arm-unknown-linux-gnueabihf" ;;
+        i686|i386) echo "i686-unknown-linux-gnu" ;;
+        *)
+            err "不支持的架构: $arch"
+            err "realm 官方 release 仅支持 x86_64 / aarch64 / armv7 / i686"
+            return 1
+            ;;
+    esac
+}
+
+# ========== 检测 ==========
+check_realm_bin()   { [[ -x "$REALM_BIN" ]] && return 0 || return 1; }
+check_service_file(){ [[ -f "$SERVICE_FILE" ]] && return 0 || return 1; }
+check_service_active(){ systemctl is-active --quiet realm 2>/dev/null && return 0 || return 1; }
+check_config()      { [[ -f "$CONFIG" ]] && return 0 || return 1; }
+
+show_status() {
+    echo ""
+    echo -e " ${CYAN}系统检测:${NC}"
+    if check_realm_bin; then
+        ok "realm 二进制:  $REALM_BIN"
+    else
+        err "realm 二进制:  未安装"
     fi
-    if [ ! -f "$CONFIG" ] && [ ! -f "${BIN}" ]; then
-        warn "realm 未安装，请先安装 realm"
-        warn "项目: https://github.com/zhboner/realm"
+    if check_service_file; then
+        ok "systemd 服务:  realm.service"
+    else
+        err "systemd 服务:  未创建"
     fi
+    if check_service_active; then
+        ok "运行状态:      运行中"
+    else
+        warn "运行状态:      未运行"
+    fi
+    if check_config; then
+        local count
+        count=$(grep -c '^\[\[endpoints\]\]' "$CONFIG" 2>/dev/null || echo 0)
+        ok "已配置:        $count 条规则"
+    else
+        warn "已配置:        暂无规则"
+    fi
+    echo ""
 }
 
-# ======== 解析规则 ========
-parse_rules() {
-    [ ! -f "$CONFIG" ] && { echo "0"; return; }
-    awk 'BEGIN { n=0; listen=""; remote=""; ip="" }
-         /^\[\[endpoints\]\]/ {
-             if (listen != "") { print n, listen, remote, ip }
-             n++; listen=""; remote=""; ip=""
-         }
-         /^listen *=/ {
-             gsub(/^[^"]*"/, ""); gsub(/"[^"]*$/, ""); listen=$0
-         }
-         /^remote *=/ {
-             gsub(/^[^"]*"/, ""); gsub(/"[^"]*$/, ""); remote=$0
-         }
-         /^bind_send_ip *=/ {
-             gsub(/^[^"]*"/, ""); gsub(/"[^"]*$/, ""); ip=$0
-         }
-         END { if (listen != "") print n, listen, remote, ip }' "$CONFIG"
+# ========== 安装 ==========
+install_realm() {
+    echo ""
+    echo -e "${CYAN}━━━ 安装 realm ━━━${NC}"
+
+    if check_realm_bin; then
+        warn "realm 已安装在 $REALM_BIN"
+        read -r -p "重新安装？ [y/N]: " confirm
+        [[ "$confirm" != "y" && "$confirm" != "Y" ]] && return
+    fi
+
+    local arch_target
+    arch_target=$(detect_arch) || return 1
+
+    local url
+    url="https://github.com/zhboner/realm/releases/latest/download/realm-${arch_target}.tar.gz"
+    echo -e " ${CYAN}→${NC} 下载: $url"
+    tmpdir=$(mktemp -d)
+    if ! curl -sL "$url" | tar xz -C "$tmpdir" 2>/dev/null; then
+        err "下载失败，请检查网络"
+        rm -rf "$tmpdir"
+        return 1
+    fi
+    mv "$tmpdir/realm" "$REALM_BIN"
+    chmod +x "$REALM_BIN"
+    rm -rf "$tmpdir"
+    ok "realm 已安装到 $REALM_BIN"
+
+    mkdir -p /etc/realm
+    if [[ ! -f "$CONFIG" ]]; then
+        echo '[[endpoints]]' > "$CONFIG"
+        echo '# listen = "[::]:1080"' >> "$CONFIG"
+        echo '# remote = "1.2.3.4:1080"' >> "$CONFIG"
+        ok "已创建默认配置 $CONFIG"
+    fi
+
+    if [[ ! -f "$SERVICE_FILE" ]]; then
+        cat > "$SERVICE_FILE" <<'SERVICE'
+[Unit]
+Description=realm proxy
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/realm -c /etc/realm/config.toml
+Restart=always
+RestartSec=5
+User=root
+
+[Install]
+WantedBy=multi-user.target
+SERVICE
+        systemctl daemon-reload
+        ok "已创建 systemd 服务"
+    fi
+
+    systemctl enable --now realm 2>/dev/null
+    ok "realm 服务已启动并设为开机自启"
+    echo ""
 }
 
-# ======== 生成配置 ========
-gen_config() {
-    cat <<'EOF'
-[network]
-# zero-copy splice 模式，v2.9+ 默认启用
-# zero_copy = true
+# ========== 卸载 ==========
+uninstall_realm() {
+    echo ""
+    echo -e "${CYAN}━━━ 卸载 realm ━━━${NC}"
+    echo -e " ${YELLOW}⚠  此操作将:${NC}"
+    echo "   - 停止并移除 realm 服务"
+    echo "   - 删除 /usr/local/bin/realm"
+    echo ""
+    read -r -p "确认卸载？ [y/N]: " confirm
+    [[ "$confirm" != "y" && "$confirm" != "Y" ]] && echo "已取消" && return
 
-[[endpoints]]
-EOF
-    local first=1
-    while IFS=' ' read -r idx l r i; do
-        [ -z "$l" ] && continue
-        [ "$first" -eq 1 ] && first=0 || echo -e "\n[[endpoints]]"
-        echo "listen = \"$l\""
-        echo "remote = \"$r\""
-        [ -n "$i" ] && [ "$i" != "-" ] && echo "bind_send_ip = \"$i\""
-    done < <(parse_rules)
+    systemctl stop realm 2>/dev/null
+    systemctl disable realm 2>/dev/null
+    rm -f "$SERVICE_FILE"
+    systemctl daemon-reload
+    rm -f "$REALM_BIN"
+    ok "realm 已卸载"
+
+    read -r -p "是否同时删除配置文件和日志？ [y/N]: " del_conf
+    if [[ "$del_conf" == "y" || "$del_conf" == "Y" ]]; then
+        rm -rf /etc/realm
+        rm -f /var/log/realm*.log 2>/dev/null
+        ok "配置文件和日志已清理"
+    else
+        warn "配置文件保留在 /etc/realm/"
+    fi
+    echo ""
 }
 
-# ======== 重写配置 ========
-rewrite_config() {
-    local tmp
-    tmp=$(gen_config)
-    if [ $? -ne 0 ]; then err "配置生成失败"; return 1; fi
-    echo "$tmp" | sed '/^$/N;/^\n$/D' > "$CONFIG"
-    ok "配置已写入 $CONFIG"
-}
-
-# ======== 列出规则 ========
+# ========== 规则管理 ==========
 list_rules() {
-    local rules
-    rules=$(parse_rules)
-    local count
-    count=$(echo "$rules" | wc -l)
-    [ "$count" -eq 0 ] || [ -z "$(echo "$rules" | head -1 | awk '{print $1}')" ] && {
-        echo " (暂无规则)"
-        return 0
-    }
-    echo ""
-    printf "  %-4s %-24s %-24s %-16s\n" "编号" "监听" "目标" "出口IP"
-    printf "  %-4s %-24s %-24s %-16s\n" "----" "----" "----" "------"
-    local i=0
-    IFS=$'\n'
-    for rule in $rules; do
-        i=$((i+1))
-        local idx l r ip
-        idx=$(echo "$rule" | awk '{print $1}')
-        l=$(echo "$rule" | awk '{print $2}')
-        r=$(echo "$rule" | awk '{print $3}')
-        ip=$(echo "$rule" | awk '{print $4}')
-        [ -z "$ip" ] && ip="-"
-        printf "  %-4s %-24s %-24s %-16s\n" "$idx" "$l" "$r" "$ip"
+    [[ ! -f "$CONFIG" ]] && return
+    grep -n '^\[\[endpoints\]\]' "$CONFIG" | while IFS=: read -r line_no _; do
+        local listen remote
+        listen=$(sed -n "$((line_no+1))p" "$CONFIG" | grep -oP 'listen\s*=\s*"\K[^"]+')
+        remote=$(sed -n "$((line_no+2))p" "$CONFIG" | grep -oP 'remote\s*=\s*"\K[^"]+')
+        echo "$line_no|$listen|$remote"
     done
-    unset IFS
-    echo ""
 }
 
-# ======== 服务状态 ========
-service_status() {
-    if systemctl is-active --quiet "$SERVICE" 2>/dev/null; then
-        echo -e "${GREEN}运行中${NC}"
-    elif systemctl is-active "$SERVICE" 2>/dev/null | grep -q 'deactivating'; then
-        echo -e "${YELLOW}正在关闭${NC}"
-    else
-        echo -e "${RED}未运行${NC}"
-    fi
-}
+view_rules() {
+    [[ ! -f "$CONFIG" ]] && echo -e "${YELLOW}暂无配置${NC}" && return
+    local rules=()
+    while IFS='|' read -r lineno listen remote; do
+        rules+=("$lineno|$listen|$remote")
+    done < <(list_rules)
 
-service_enabled_text() {
-    if systemctl is-enabled --quiet "$SERVICE" 2>/dev/null; then
-        echo -e "${GREEN}已启用${NC}"
-    else
-        echo -e "${RED}未启用${NC}"
-    fi
-}
-
-# ======== 重启提示 ========
-restart_prompt() {
-    echo ""
-    info "是否重启 realm 服务使配置生效？"
-    echo -n "  [y/n] (默认 y): "; read -r ans
-    case "${ans,,}" in
-        n|no) warn "配置已保存，记得稍后手动重启" ;;
-        *) restart_service ;;
-    esac
-}
-
-# ======== 服务操作 ========
-start_service() {
-    systemctl start "$SERVICE" 2>/dev/null
-    sleep 1
-    if systemctl is-active --quiet "$SERVICE" 2>/dev/null; then
-        ok "realm 已启动"
-    else
-        err "启动失败，检查日志: ${YELLOW}journalctl -u $SERVICE -n 20${NC}"
-    fi
-}
-
-restart_service() {
-    systemctl restart "$SERVICE" 2>/dev/null
-    sleep 1
-    if systemctl is-active --quiet "$SERVICE" 2>/dev/null; then
-        ok "realm 已重启"
-    else
-        err "重启失败，检查日志: ${YELLOW}journalctl -u $SERVICE -n 20${NC}"
-    fi
-}
-
-stop_service() {
-    systemctl stop "$SERVICE" 2>/dev/null
-    ok "realm 已停止"
-}
-
-# ======== 菜单 ========
-
-menu_add() {
-    echo ""
-    echo -e "${CYAN}━━━ 新增转发规则 ━━━${NC}"
-
-    # 监听地址，默认 [::]:端口
-    echo -n "监听端口 (如 10086): "
-    read -r port
-    echo -n "监听地址 (默认 [::] 双栈): "
-    read -r listen
-    [ -z "$listen" ] && listen="$DEFAULT_LISTEN"
-    local listen_full="$listen:$port"
-
-    echo -n "目标地址 (如 143.14.86.51:10086): "
-    read -r remote
-
-    echo -n "出口 IP 绑定 (可留空): "
-    read -r bind_ip
-
-    echo ""
-    echo "确认添加："
-    echo "  监听 → $listen_full"
-    echo "  目标 → $remote"
-    [ -n "$bind_ip" ] && echo "  出口 → $bind_ip"
-    echo -n "  [y/n] (默认 y): "; read -r ans
-    case "${ans,,}" in
-        n|no) info "已取消"; return ;;
-    esac
-
-    # 追加规则
-    {
-        echo ""
-        echo "[[endpoints]]"
-        echo "listen = \"$listen_full\""
-        echo "remote = \"$remote\""
-        [ -n "$bind_ip" ] && echo "bind_send_ip = \"$bind_ip\""
-    } >> "$CONFIG"
-    ok "规则已添加"
-
-    restart_prompt
-}
-
-menu_list() {
-    echo ""
-    echo -e "${CYAN}━━━ 转发规则列表 ━━━${NC}"
-    local rules rules_count
-    rules=$(parse_rules)
-    rules_count=$(echo "$rules" | wc -l)
-    if [ "$rules_count" -eq 0 ] || [ -z "$(echo "$rules" | head -1 | awk '{print $1}' 2>/dev/null)" ]; then
-        warn "暂无规则"
-        return
-    fi
-    list_rules
-
-    echo "操作选项："
-    echo "  输入编号 → 进入该规则的操作"
-    echo "  直接回车 → 返回主菜单"
-    echo ""
-    echo -n "选择: "; read -r opt
-
-    [ -z "$opt" ] && return
-
-    local idx="$opt"
-    if ! echo "$rules" | awk -v n="$idx" '$1==n {found=1; exit} END {exit !found}'; then
-        err "规则 #$idx 不存在"
-        sleep 1
+    local count=${#rules[@]}
+    if [[ $count -eq 0 ]]; then
+        echo -e "${YELLOW}暂无转发规则${NC}"
         return
     fi
 
-    # 提取当前值
-    local cur_l cur_r cur_ip
-    cur_l=$(echo "$rules" | awk -v n="$idx" '$1==n {print $2}')
-    cur_r=$(echo "$rules" | awk -v n="$idx" '$1==n {print $3}')
-    cur_ip=$(echo "$rules" | awk -v n="$idx" '$1==n {print $4}')
-    [ "$cur_ip" = "-" ] && cur_ip=""
+    echo ""
+    echo -e "${CYAN}现有规则:${NC}"
+    for ((i=0; i<count; i++)); do
+        IFS='|' read -r lineno listen remote <<< "${rules[$i]}"
+        echo -e "  ${GREEN}[$((i+1))]${NC} $listen → $remote"
+    done
+    echo ""
 
+    read -r -p "选择 [1-$count] / [0] 返回: " idx
+    [[ -z "$idx" ]] && idx=0
+    [[ "$idx" -eq 0 ]] && return
+    [[ "$idx" -gt "$count" || "$idx" -lt 0 ]] && warn "规则 #$idx 不存在" && return
+
+    IFS='|' read -r lineno listen remote <<< "${rules[$((idx-1))]}"
     echo ""
-    echo -e "${CYAN}━━━ 规则 #${idx} ━━━${NC}"
-    echo "  监听: $cur_l"
-    echo "  目标: $cur_r"
-    [ -n "$cur_ip" ] && echo "  出口: $cur_ip"
+    echo -e "${CYAN}━━━ 规则 #$idx ━━━${NC}"
+    echo -e "  监听: ${GREEN}$listen${NC}"
+    echo -e "  目标: ${GREEN}$remote${NC}"
     echo ""
-    echo "  操作："
-    echo "    [1] 修改"
-    echo "    [2] 删除"
-    echo "    [0] 返回"
+    echo -e " ${CYAN}[1]${NC} 修改"
+    echo -e " ${CYAN}[2]${NC} 删除"
+    echo -e " ${CYAN}[0]${NC} 返回"
     echo ""
-    echo -n "选择 [0/1/2]: "; read -r action
+    read -r -p "选择 [0/1/2]: " action
 
     case "$action" in
-        1)  # 修改
+        1)
+            read -r -p "确认修改规则 #$idx？ [y/N]: " confirm
+            [[ "$confirm" != "y" && "$confirm" != "Y" ]] && return
             echo ""
-            echo -n "确认修改规则 #${idx}？ [y/N]: "; read -r confirm
-            case "${confirm,,}" in
-                y|yes) ;;
-                *) warn "已取消"; return ;;
-            esac
-            echo ""
-            echo -e "${CYAN}━━━ 修改规则 #${idx} ━━━${NC}"
-            echo "（留空 = 不修改）"
-            echo -n "监听 [当前: $cur_l]: "; read -r new_l
-            echo -n "目标 [当前: $cur_r]: "; read -r new_r
-            echo -n "出口IP [当前: ${cur_ip:-(无)}]: "; read -r new_ip
-
-            [ -z "$new_l" ] && new_l="$cur_l"
-            [ -z "$new_r" ] && new_r="$cur_r"
-            [ -z "$new_ip" ] && new_ip="$cur_ip"
-
-            local first=1
-            local tmp
-            tmp=$(
-                local first=1
-                while IFS=' ' read -r idx2 l r i; do
-                    [ -z "$l" ] && continue
-                    [ "$first" -eq 1 ] && first=0 || echo -e "\n[[endpoints]]"
-                    if [ "$idx2" = "$idx" ]; then
-                        echo "listen = \"$new_l\""
-                        echo "remote = \"$new_r\""
-                        [ -n "$new_ip" ] && echo "bind_send_ip = \"$new_ip\""
-                    else
-                        echo "listen = \"$l\""
-                        echo "remote = \"$r\""
-                        [ -n "$i" ] && [ "$i" != "-" ] && echo "bind_send_ip = \"$i\""
-                    fi
-                done < <(echo "$rules")
-                [ "$first" -eq 1 ] && echo ""
-            )
-            echo "$tmp" | sed '/^$/N;/^\n$/D' > "$CONFIG"
+            echo -e "${CYAN}━━━ 修改规则 #$idx ━━━${NC}"
+            read -r -p "监听 [当前: $listen]: " new_listen
+            read -r -p "目标 [当前: $remote]: " new_remote
+            new_listen="${new_listen:-$listen}"
+            new_remote="${new_remote:-$remote}"
+            sed -i "${lineno}s/.*/[[endpoints]]/" "$CONFIG"
+            sed -i "$((lineno+1))s/.*/listen = \"$new_listen\"/" "$CONFIG"
+            sed -i "$((lineno+2))s/.*/remote = \"$new_remote\"/" "$CONFIG"
             ok "规则 #$idx 已更新"
-            restart_prompt
+            warn "重启 realm 使新规则生效"
             ;;
-        2)  # 删除
-            echo ""
-            echo -n "确认删除规则 #${idx}？ [y/N]: "; read -r confirm
-            case "${confirm,,}" in
-                y|yes) ;;
-                *) warn "已取消"; return ;;
-            esac
-            local tmp
-            tmp=$(
-                local first=1
-                while IFS=' ' read -r idx2 l r i; do
-                    [ -z "$l" ] && continue
-                    [ "$idx2" = "$idx" ] && continue
-                    [ "$first" -eq 1 ] && first=0 || echo -e "\n[[endpoints]]"
-                    echo "listen = \"$l\""
-                    echo "remote = \"$r\""
-                    [ -n "$i" ] && [ "$i" != "-" ] && echo "bind_send_ip = \"$i\""
-                done < <(echo "$rules")
-                [ "$first" -eq 1 ] && echo ""
-            )
-            echo "$tmp" | sed '/^$/N;/^\n$/D' > "$CONFIG"
+        2)
+            read -r -p "确认删除规则 #$idx？ [y/N]: " confirm
+            [[ "$confirm" != "y" && "$confirm" != "Y" ]] && return
+            sed -i "${lineno},+2d" "$CONFIG"
+            # 清理可能的空行
+            sed -i '/^$/d' "$CONFIG"
+            # 如果文件只有注释，补个 [[endpoints]] 占位
+            if ! grep -q '^\[\[endpoints\]\]' "$CONFIG" 2>/dev/null; then
+                echo '[[endpoints]]' >> "$CONFIG"
+            fi
             ok "规则 #$idx 已删除"
-            restart_prompt
+            warn "重启 realm 使更新生效"
             ;;
-        0|"") return ;;
         *) return ;;
     esac
 }
 
-menu_status() {
+# ========== 新增规则 ==========
+add_rule() {
+    [[ ! -f "$CONFIG" ]] && echo '[[endpoints]]' > "$CONFIG"
     echo ""
-    echo -e "${CYAN}━━━ 服务状态 ━━━${NC}"
-    printf "  运行状态:  "; service_status
-    printf "  开机自启:  "; service_enabled_text
-    if systemctl is-active --quiet "$SERVICE" 2>/dev/null; then
-        local pid
-        pid=$(systemctl show -p MainPID "$SERVICE" 2>/dev/null | cut -d= -f2)
-        [ -n "$pid" ] && [ "$pid" -gt 1 ] && printf "  进程 PID:  %s\n" "$pid"
-        local rss
-        rss=$(ps -o rss= -p "$pid" 2>/dev/null)
-        [ -n "$rss" ] && printf "  内存占用:  %d MB\n" $((rss/1024))
+    echo -e "${CYAN}━━━ 新增规则 ━━━${NC}"
+    read -r -p "监听地址及端口 (默认 [::]:双栈): " listen
+    while [[ -z "$listen" ]]; do
+        read -r -p "请输端口号或完整地址: " listen
+    done
+    # 如果只输了数字，自动补全为双栈
+    if [[ "$listen" =~ ^[0-9]+$ ]]; then
+        listen="[::]:$listen"
     fi
-    echo ""
-    info "配置文件: $CONFIG"
-    info "二进制:    $BIN"
-}
 
-menu_logs() {
-    echo ""
-    echo -e "${CYAN}━━━ 实时日志（Ctrl+C 退出）━━━${NC}"
-    sleep 1
-    journalctl -u "$SERVICE" -n 30 -f --no-pager 2>/dev/null || {
-        err "日志不可用，检查 service 名称"
-    }
-}
+    read -r -p "目标地址及端口: " remote
+    while [[ -z "$remote" ]]; do
+        read -r -p "目标必须指定: " remote
+    done
 
-menu_start()    { start_service; }
-menu_restart()  { restart_service; }
-menu_stop()     { stop_service; }
+    echo ""
+    echo -e "  监听: ${GREEN}$listen${NC}"
+    echo -e "  目标: ${GREEN}$remote${NC}"
+    echo ""
+    read -r -p "确认添加？ [y/N]: " confirm
+    [[ "$confirm" != "y" && "$confirm" != "Y" ]] && echo "已取消" && return
 
-show_header() {
-    clear 2>/dev/null || true
-    echo ""
-    echo -e "  ${YELLOW}╔══════════════════════════════════╗${NC}"
-    echo -e "  ${YELLOW}║     Realm 转发管理 v1.0 🍊      ║${NC}"
-    echo -e "  ${YELLOW}╚══════════════════════════════════╝${NC}"
-    echo ""
-    # 规则概览
-    echo -e "  ${CYAN}当前规则:${NC}"
-    list_rules
-    echo -e "  服务状态: $(service_status)  配置文件: $CONFIG"
-    echo ""
-}
-
-show_menu() {
-    echo -e "  ${YELLOW}┌─────────────────────────────────┐${NC}"
-    echo -e "  ${YELLOW}│${NC}  ${GREEN}[1]${NC} 查看/修改/删除规则            ${YELLOW}│${NC}"
-    echo -e "  ${YELLOW}│${NC}  ${GREEN}[2]${NC} 新增转发规则               ${YELLOW}│${NC}"
-    echo -e "  ${YELLOW}│${NC}  ${GREEN}[3]${NC} 启动服务                    ${YELLOW}│${NC}"
-    echo -e "  ${YELLOW}│${NC}  ${GREEN}[4]${NC} 重启服务                    ${YELLOW}│${NC}"
-    echo -e "  ${YELLOW}│${NC}  ${GREEN}[5]${NC} 停止服务                    ${YELLOW}│${NC}"
-    echo -e "  ${YELLOW}│${NC}  ${GREEN}[6]${NC} 服务状态                    ${YELLOW}│${NC}"
-    echo -e "  ${YELLOW}│${NC}  ${GREEN}[7]${NC} 实时日志                    ${YELLOW}│${NC}"
-    echo -e "  ${YELLOW}│${NC}  ${GREEN}[q]${NC} 退出                       ${YELLOW}│${NC}"
-    echo -e "  ${YELLOW}└─────────────────────────────────┘${NC}"
-    echo ""
-    echo -n "  选择 [1-7/q]: "; read -r choice
-    echo ""
-}
-
-# ======== 初始化 ========
-init() {
-    check_deps
-    if [ ! -f "$CONFIG" ]; then
-        info "配置文件 $CONFIG 不存在，创建默认配置"
-        mkdir -p "$(dirname "$CONFIG")"
-        cat > "$CONFIG" <<'EOF'
-[network]
-# zero-copy splice 模式，v2.9+ 默认启用
-# zero_copy = true
-EOF
-        ok "已创建 $CONFIG"
+    # 如果文件只有空的占位 [[endpoints]]，替换掉
+    local lines
+    lines=$(grep -c '^\[\[endpoints\]\]' "$CONFIG" 2>/dev/null || echo 0)
+    if [[ "$lines" -eq 1 ]]; then
+        local content_after
+        content_after=$(grep -A1 '^\[\[endpoints\]\]' "$CONFIG" | tail -1)
+        if [[ -z "$content_after" || "$content_after" =~ ^# ]]; then
+            sed -i "0,/^\[\[endpoints\]\]/{/^\[\[endpoints\]\]/d}" "$CONFIG"
+            # 清理随后的空行
+            sed -i '/^$/d' "$CONFIG"
+        fi
     fi
-    # 确保统一换行
-    sed -i 's/\r$//' "$CONFIG"
+
+    {
+        echo "[[endpoints]]"
+        echo "listen = \"$listen\""
+        echo "remote = \"$remote\""
+    } >> "$CONFIG"
+
+    ok "规则已添加"
+    warn "重启 realm 使新规则生效"
+    echo ""
 }
 
-# ======== 主循环 ========
-init
+# ========== 服务管理 ==========
+do_start()   { systemctl start realm 2>/dev/null && ok "realm 已启动" || err "启动失败"; }
+do_restart() { systemctl restart realm 2>/dev/null && ok "realm 已重启" || err "重启失败"; }
+do_stop()    { systemctl stop realm 2>/dev/null && ok "realm 已停止" || err "停止失败"; }
+do_status()  { echo ""; systemctl status realm --no-pager 2>/dev/null; echo ""; }
+do_logs()    { journalctl -u realm -f --no-pager; }
+
+# ========== 前置检查 ==========
+require_installed() {
+    if ! check_realm_bin; then
+        err "realm 未安装，请先执行 [1] 安装"
+        return 1
+    fi
+    if ! check_service_file; then
+        err "systemd 服务未创建，请先执行 [1] 安装"
+        return 1
+    fi
+    return 0
+}
+
+# ========== 主循环 ==========
 while true; do
-    show_header
-    show_menu
+    clear
+    echo ""
+    echo -e "${CYAN}╔══════════════════════════════════╗${NC}"
+    echo -e "${CYAN}║     Realm 转发管理 v2.0 🍊       ║${NC}"
+    echo -e "${CYAN}╚══════════════════════════════════╝${NC}"
+    echo ""
+
+    show_status
+
+    echo -e " ${CYAN}安装管理:${NC}"
+    echo -e "   ${GREEN}[1]${NC} 安装 realm"
+    echo -e "   ${GREEN}[2]${NC} 卸载 realm"
+    echo ""
+    echo -e " ${CYAN}规则管理:${NC}"
+    echo -e "   ${GREEN}[3]${NC} 查看/修改/删除规则"
+    echo -e "   ${GREEN}[4]${NC} 新增规则"
+    echo ""
+    echo -e " ${CYAN}服务管理:${NC}"
+    echo -e "   ${GREEN}[5]${NC} 启动服务"
+    echo -e "   ${GREEN}[6]${NC} 重启服务"
+    echo -e "   ${GREEN}[7]${NC} 停止服务"
+    echo -e "   ${GREEN}[8]${NC} 服务状态"
+    echo -e "   ${GREEN}[9]${NC} 实时日志"
+    echo ""
+    echo -e "   ${GREEN}[q]${NC} 退出"
+    echo ""
+
+    read -r -p "选择 > " choice
+
     case "$choice" in
-        1) menu_list ;;
-        2) menu_add ;;
-        3) menu_start ;;
-        4) menu_restart ;;
-        5) menu_stop ;;
-        6) menu_status ;;
-        7) menu_logs ;;
-        q|Q) echo -e "  ${GREEN}bye~${NC} 🍊" ; break ;;
-        *) warn "无效选择，按 1-7 或 q" ; sleep 1 ;;
+        1) install_realm ;;
+        2) uninstall_realm ;;
+        3) require_installed && view_rules ;;
+        4) require_installed && add_rule ;;
+        5) require_installed && do_start ;;
+        6) require_installed && do_restart ;;
+        7) require_installed && do_stop ;;
+        8) require_installed && do_status ;;
+        9) require_installed && do_logs ;;
+        q|Q) echo -e "${CYAN}bye~ 💕${NC}" && exit 0 ;;
+        *) warn "无效选择，按 1-9 或 q" && sleep 1 ;;
     esac
+    read -r -p "按回车继续..."
 done
