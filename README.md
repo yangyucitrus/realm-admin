@@ -1,4 +1,4 @@
-# realm-admin 🛡️
+# realm 🛡️
 
 realm 零拷贝 TCP 转发管理交互脚本。轻量、直观、全键盘操作。
 
@@ -27,9 +27,9 @@ sudo mv realm /usr/local/bin/
 sudo mkdir -p /etc/realm
 
 # 2. 下载脚本
-sudo curl -o /usr/local/bin/realm-admin.sh \
-  https://raw.githubusercontent.com/yangyucitrus/realm-admin/main/realm-admin.sh
-sudo chmod +x /usr/local/bin/realm-admin.sh
+sudo curl -o /usr/local/bin/realm.sh \
+  https://raw.githubusercontent.com/yangyucitrus/realm-admin/main/realm.sh
+sudo chmod +x /usr/local/bin/realm.sh
 
 # 3. 创建 systemd 服务
 sudo tee /etc/systemd/system/realm.service > /dev/null <<'SERVICE'
@@ -53,7 +53,7 @@ sudo systemctl daemon-reload
 ## 使用
 
 ```bash
-sudo bash /usr/local/bin/realm-admin.sh
+sudo bash /usr/local/bin/realm.sh
 ```
 
 ## 脚本一览
