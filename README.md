@@ -56,6 +56,18 @@ sudo systemctl daemon-reload
 sudo bash /usr/local/bin/realm.sh
 ```
 
+### 一键运行（无需安装）
+
+```bash
+bash <(curl -sL https://raw.githubusercontent.com/yangyucitrus/realm-admin/main/realm.sh)
+```
+
+国内加速（ghproxy 代理）：
+
+```bash
+bash <(curl -sL https://ghproxy.net/https://raw.githubusercontent.com/yangyucitrus/realm-admin/main/realm.sh)
+```
+
 ## 脚本一览
 
 ```
